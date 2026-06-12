@@ -17,7 +17,7 @@ Features proper semantic version comparison (including beta/pre-release tags) an
 - **Python** 3.7+
 - Standard library only — no third-party packages required
 
-## Installation
+## Setup
 
 ```bash
 git clone https://github.com/love4taylor/snell-server-updater.git
@@ -27,7 +27,43 @@ chmod +x snell-server-updater.py
 
 ## Usage
 
-### Upgrade to the latest stable release
+### Fresh install (first-time setup)
+
+When Snell is **not yet installed** on your system, use `--install` to download the binary and set up the systemd service in one shot:
+
+```bash
+sudo python3 snell-server-updater.py --install
+# or
+sudo python3 snell-server-updater.py -i
+```
+
+This performs the following steps:
+1. Downloads the latest stable `snell-server` binary to `/usr/local/bin/snell-server`
+2. Creates a system user `snell` (shell: `/usr/sbin/nologin`)
+3. Creates the config directory `/usr/local/etc/snell-server/`
+4. Runs the interactive wizard to generate `server.conf`
+5. Installs `snell-server.service` and `snell-server@.service`
+6. Runs `systemctl daemon-reload`
+
+After deployment, start the service with:
+
+```bash
+# Single instance
+systemctl enable --now snell-server
+
+# Multiple instances (via the @ template)
+systemctl enable --now snell-server@myprofile
+```
+
+If you already have a config file or prefer to skip the interactive wizard:
+
+```bash
+sudo python3 snell-server-updater.py --install --skip-wizard
+```
+
+### Upgrade an existing installation
+
+> **Requirement:** `snell-server` must already be present in `PATH` (e.g. from a previous manual install or `--install`).
 
 ```bash
 sudo python3 snell-server-updater.py
@@ -35,7 +71,7 @@ sudo python3 snell-server-updater.py
 
 The script automatically:
 1. Detects the current CPU architecture
-2. Locates an existing `snell-server` binary (searches `PATH`)
+2. Locates the existing `snell-server` binary (searches `PATH`)
 3. Reads the current version
 4. Discovers the latest stable version from the official release page
 5. Downloads and installs if a newer version is available
@@ -77,39 +113,6 @@ sudo python3 snell-server-updater.py --dry-run
 # or
 sudo python3 snell-server-updater.py -n
 ```
-
-### Deploy as a systemd service
-
-```bash
-sudo python3 snell-server-updater.py --install
-# or
-sudo python3 snell-server-updater.py -i
-```
-
-This performs the following steps:
-1. Creates a system user `snell` (shell: `/usr/sbin/nologin`)
-2. Creates the config directory `/usr/local/etc/snell-server/`
-3. Runs the interactive wizard to generate `server.conf`
-4. Installs `snell-server.service` and `snell-server@.service`
-5. Runs `systemctl daemon-reload`
-
-After deployment, start the service with:
-
-```bash
-# Single instance
-systemctl enable --now snell-server
-
-# Multiple instances (via the @ template)
-systemctl enable --now snell-server@myprofile
-```
-
-### Skip the configuration wizard
-
-```bash
-sudo python3 snell-server-updater.py --install --skip-wizard
-```
-
-Useful when a config file already exists at the standard location.
 
 ## Options
 
