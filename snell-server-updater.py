@@ -360,11 +360,22 @@ def download_and_install(url: str, snell_path: Path) -> bool:
 
         log(f"   Binary OK  -  {ver_output.splitlines()[0]}")
 
-        # Safe to install now
+        # Safe to install now (atomic replace to handle running service)
         install_dir = snell_path.parent
         if not install_dir.exists():
             install_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(extracted, snell_path)
+        tmp_target = install_dir / f".{snell_path.name}.new.{os.getpid()}"
+        try:
+            shutil.copy2(extracted, tmp_target)
+            tmp_target.chmod(0o755)
+            os.replace(tmp_target, snell_path)
+        except PermissionError:
+            fail("Permission denied; run with sudo/root")
+        finally:
+            try:
+                tmp_target.unlink()
+            except FileNotFoundError:
+                pass
         log(f"\u2728 Update complete!  {ver_output.splitlines()[0]}")
         return True
 
