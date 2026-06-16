@@ -1,32 +1,38 @@
 # snell-monitor
 
-A lightweight daemon that monitors [Snell](https://kb.nssurge.com/surge-knowledge-base/release-notes/snell) server journal logs in real time, detects connection failures (e.g. "connection refused"), and sends batched alerts via a Telegram Bot.
+[![Python](https://img.shields.io/badge/Python-3.9+-3c873a?style=flat-square&logo=python&logoColor=white)](https://www.python.org)
+[![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](../LICENSE)
 
-Designed to complement `snell-server-updater` by providing operational visibility into Snell proxy instances.
+A lightweight daemon that monitors [Snell](https://kb.nssurge.com/surge-knowledge-base/release-notes/snell) server journal logs in real time, detects connection failures, and sends batched alerts via a Telegram Bot. Designed to complement **snell-server-updater** by providing operational visibility into Snell proxy instances.
 
-## Features
+[Overview](#overview) • [Setup](#setup) • [Usage](#usage) • [Configuration](#configuration) • [How it works](#how-it-works)
 
-- 📡 **Real-time journal monitoring** — reads systemd journal natively via `systemd.journal.Reader` (no subprocess overhead)
-- 🔔 **Telegram alerts** — sends rich HTML-formatted messages when monitored connection errors are detected
-- 📦 **Batched flushing** — groups alerts that occur within a short window into a single message to reduce noise
-- 🧊 **Cooldown deduplication** — suppresses repeat alerts for the same domain + error type within a configurable interval
-- 🔙 **Startup lookback** — optionally scans the last N minutes of logs on startup to catch errors that occurred while the monitor was down
-- 🏷️ **Service-aware** — distinguishes between `snell-server` and `snell-server@*.service` instances
-- 🛡️ **Systemd security hardening** — ships with a hardened service unit (`PrivateTmp`, `ProtectSystem=strict`, etc.)
+## Overview
 
-## Dependencies
+**snell-monitor** reads the systemd journal natively via `systemd.journal.Reader`, watching for error patterns in `snell-server` log output. When connection failures are detected (e.g. "connection refused"), alerts are batched, deduplicated, and forwarded to a Telegram chat.
 
-- **Python** 3.9+
-- **python3-systemd** — `apt install python3-systemd`
-- **requests** — `pip install requests` or `apt install python3-requests`
+Key design decisions:
+
+- **Native journal access** — uses Python's `systemd.journal` bindings instead of shelling out to `journalctl`, avoiding subprocess overhead
+- **Batched + deduplicated alerts** — bursts of errors from the same domain are grouped and rate-limited to prevent notification fatigue
+- **Systemd hardening** — ships with a hardened service unit (`PrivateTmp`, `ProtectSystem=strict`, restricted read/write paths)
 
 ## Setup
+
+**Requirements:** Python 3.9+, plus two dependencies:
+
+```bash
+apt install python3-systemd
+pip install requests   # or: apt install python3-requests
+```
+
+**Installation:**
 
 ```bash
 # Install the script
 sudo install -m 755 snell-monitor /usr/local/bin/snell-monitor
 
-# Install the configuration file (creates parent directories automatically)
+# Install the configuration file
 sudo install -m 644 -D snell-monitor.conf /usr/local/etc/snell-monitor.conf
 
 # Edit the configuration with your Telegram credentials
@@ -37,6 +43,9 @@ sudo install -m 644 snell-monitor.service /etc/systemd/system/snell-monitor.serv
 sudo systemctl daemon-reload
 sudo systemctl enable --now snell-monitor
 ```
+
+> [!NOTE]
+> The monitor relies on `SyslogIdentifier=snell-server` being set in the Snell server service units. The `snell-server-updater` installer sets this automatically.
 
 ## Usage
 
@@ -56,7 +65,7 @@ Send a test message to verify your bot token and chat ID are configured correctl
 
 ### Debug mode
 
-Enable verbose logging that shows every journal entry being processed:
+Enable verbose logging that shows every journal entry as it is processed:
 
 ```bash
 /usr/local/bin/snell-monitor --debug
@@ -65,12 +74,11 @@ Enable verbose logging that shows every journal entry being processed:
 ### Manage via systemd
 
 ```bash
-# Start / stop / restart
 systemctl start snell-monitor
 systemctl stop snell-monitor
 systemctl restart snell-monitor
 
-# View logs
+# View live logs
 journalctl -u snell-monitor -f
 ```
 
@@ -100,22 +108,12 @@ TIMEZONE="UTC"
 
 1. On startup, optionally scans recent journal entries (`STARTUP_LOOKBACK`) for missed alerts.
 2. Enters a polling loop, reading new `snell-server` journal entries in real time.
-3. Each log line is parsed against `MONITOR_ERRORS` using a regex pattern.
-4. Matched failures are deduplicated per domain+error via a cooldown window.
-5. Alerts are batched and flushed every 30 seconds (or after a 5-second initial delay once the first alert arrives).
+3. Each log line is matched against `MONITOR_ERRORS` using a regex pattern.
+4. Matched failures are deduplicated per domain + error via a cooldown window.
+5. Alerts are batched and flushed every 30 seconds (or 5 seconds after the first alert arrives).
 6. Batched messages are sent as HTML-formatted Telegram messages grouped by service unit.
 
-## systemd paths
-
-| Path | Description |
-|------|-------------|
-| `/usr/local/bin/snell-monitor` | Monitor script |
-| `/usr/local/etc/snell-monitor.conf` | Configuration file |
-| `/etc/systemd/system/snell-monitor.service` | Systemd unit |
-
-> **Note:** The monitor relies on `SyslogIdentifier=snell-server` being set in the Snell server service units. The `snell-server-updater` installer sets this automatically.
-
-## Alert format
+### Alert format
 
 Alerts are sent as Telegram HTML messages with the following structure:
 
@@ -136,14 +134,18 @@ Alerts are sent as Telegram HTML messages with the following structure:
     • api.other.com
 ```
 
-## Safety
+### Safety
 
-- Alerts are **batched** — sudden bursts of errors will be grouped into a single message.
-- **Deduplication** prevents flooding when a domain is persistently unreachable.
-- A **hard cap** on the pending alert queue prevents unbounded memory growth if Telegram is unreachable.
-- Graceful shutdown via `SIGTERM`/`SIGINT` flushes any remaining pending alerts before exiting.
-- The systemd unit includes **security hardening** directives (`PrivateTmp`, `ProtectSystem=strict`, `ProtectHome=yes`, restricted read/write paths).
+- **Batched flushing** — sudden bursts of errors are grouped into a single message to reduce noise.
+- **Cooldown deduplication** — the same domain + error type is suppressed within the configured interval.
+- **Queue cap** — a hard limit on the pending alert queue prevents unbounded memory growth if Telegram is unreachable.
+- **Graceful shutdown** — `SIGTERM`/`SIGINT` flush any remaining pending alerts before exiting.
+- **Systemd hardening** — the service unit includes `PrivateTmp=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, and restricted read/write paths.
 
-## License
+### systemd paths
 
-MIT License — see [../LICENSE](../LICENSE) for details.
+| Path | Description |
+|------|-------------|
+| `/usr/local/bin/snell-monitor` | Monitor script |
+| `/usr/local/etc/snell-monitor.conf` | Configuration file |
+| `/etc/systemd/system/snell-monitor.service` | Systemd unit |
