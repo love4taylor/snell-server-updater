@@ -1,0 +1,650 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Snell Server Connection Monitor
+
+Monitors systemd journal logs for snell-server@* and snell-server in real time,
+detects domains with "connection refused" (and other configurable connection errors),
+and sends alerts via Telegram Bot.
+
+Uses systemd.journal.Reader to read logs natively — no journalctl subprocess.
+
+Requirements:
+    - Python 3.9+
+    - python3-systemd   (apt install python3-systemd)
+    - requests           (pip install requests  or  apt install python3-requests)
+
+Configuration (environment variables or /usr/local/etc/snell-monitor.conf):
+    TELEGRAM_BOT_TOKEN  - Telegram Bot Token (required)
+    TELEGRAM_CHAT_ID    - Telegram Chat ID (required)
+    MONITOR_ERRORS      - Comma-separated error types to monitor (default: "connection refused")
+    ALERT_COOLDOWN      - Seconds between repeat alerts for the same domain (default: 3600)
+    STARTUP_LOOKBACK    - Minutes of history to scan on startup (default: 0)
+    POLL_INTERVAL       - Seconds between journal polls (default: 1.0)
+    TIMEZONE            - Timezone for alert timestamps (default: Asia/Shanghai)
+    LOG_LEVEL           - Logging level (default: INFO)
+
+Usage:
+    /usr/local/bin/snell-monitor
+    /usr/local/bin/snell-monitor --test-telegram
+    systemctl enable --now snell-monitor.service
+"""
+
+import argparse
+import logging
+import os
+import re
+import signal
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # Python 3.9+
+except ImportError:
+    ZoneInfo = None  # type: ignore[assignment]
+    ZoneInfoNotFoundError = Exception
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stderr)],
+)
+logger = logging.getLogger("snell-monitor")
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONFIG_FILE = "/usr/local/etc/snell-monitor.conf"
+
+DEFAULT_CONFIG: Dict = {
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
+    "monitor_errors": ["connection refused"],
+    "alert_cooldown": 3600,
+    "startup_lookback": 0,
+    "poll_interval": 1.0,
+    "timezone": "Asia/Shanghai",
+}
+
+
+def _parse_error_list(raw: str) -> List[str]:
+    """Parse comma-separated error type strings."""
+    return [e.strip().lower() for e in raw.split(",") if e.strip()]
+
+
+def _get_timezone(name: str) -> Any:
+    """Convert a timezone name to a tzinfo object. Falls back to UTC on failure."""
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, KeyError):
+            logger.warning(f"Unknown timezone '{name}', falling back to UTC")
+    else:
+        logger.warning("zoneinfo not available (Python < 3.9), falling back to UTC")
+    return timezone.utc
+
+
+def load_config() -> Dict:
+    """Load configuration from environment variables or config file.
+    Environment variables take precedence over the config file.
+    """
+    config = dict(DEFAULT_CONFIG)
+    config["monitor_errors"] = list(DEFAULT_CONFIG["monitor_errors"])
+
+    # 1. Read config file first
+    config_file = os.environ.get("CONFIG_FILE", DEFAULT_CONFIG_FILE)
+    if os.path.isfile(config_file):
+        logger.info(f"Loading config from {config_file}")
+        try:
+            with open(config_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key == "MONITOR_ERRORS":
+                        config["monitor_errors"] = _parse_error_list(value)
+                    elif key in ("ALERT_COOLDOWN", "STARTUP_LOOKBACK", "POLL_INTERVAL"):
+                        try:
+                            config[key.lower()] = float(value)
+                        except ValueError:
+                            logger.warning(f"Invalid integer for {key}: {value}")
+                    elif key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TIMEZONE"):
+                        config[key.lower()] = value
+        except OSError as e:
+            logger.warning(f"Failed to read config file {config_file}: {e}")
+
+    # 2. Environment variables override config file
+    env_map = {
+        "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
+        "TELEGRAM_CHAT_ID": "telegram_chat_id",
+        "TIMEZONE": "timezone",
+    }
+    for env_key, config_key in env_map.items():
+        val = os.environ.get(env_key, "")
+        if val:
+            config[config_key] = val
+
+    if os.environ.get("MONITOR_ERRORS"):
+        config["monitor_errors"] = _parse_error_list(os.environ["MONITOR_ERRORS"])
+
+    for key in ("ALERT_COOLDOWN", "STARTUP_LOOKBACK", "POLL_INTERVAL"):
+        env_key = key.upper()
+        if os.environ.get(env_key):
+            try:
+                config[key.lower()] = float(os.environ[env_key])
+            except ValueError:
+                logger.warning(f"Invalid integer for {env_key}")
+
+    return config
+
+
+def validate_config(config: Dict) -> bool:
+    """Validate required configuration fields."""
+    missing = []
+    if not config["telegram_bot_token"]:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not config["telegram_chat_id"]:
+        missing.append("TELEGRAM_CHAT_ID")
+    if missing:
+        logger.error(
+            f"Missing required config: {', '.join(missing)}. "
+            "Set via environment variables or config file."
+        )
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Telegram
+# ---------------------------------------------------------------------------
+
+
+def send_telegram_message(bot_token: str, chat_id: str, text: str) -> bool:
+    """Send a message via the Telegram Bot API."""
+    try:
+        import requests  # noqa: PLC0415
+    except ImportError:
+        logger.error(
+            "The 'requests' package is required for Telegram notifications. "
+            "Install: pip install requests  or  apt install python3-requests"
+        )
+        return False
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+
+    try:
+        resp = requests.post(url, json=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("ok"):
+            logger.error(f"Telegram API error: {data.get('description', 'unknown')}")
+            return False
+        return True
+    except requests.RequestException as e:
+        logger.error(f"Failed to send Telegram message: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Log parsing
+# ---------------------------------------------------------------------------
+
+# Match "Outgoing connection connect error: <domain> (<error_type>)"
+_LOG_ERROR_RE = re.compile(
+    r"Outgoing connection connect error:\s+"
+    r"([^\s(]+)"  # domain / hostname
+    r"\s+\((.+?)\)",  # error type
+    re.IGNORECASE,
+)
+
+
+def parse_log_entry(message: str) -> Optional[Tuple[str, str]]:
+    """
+    Extract domain and error type from a snell-server log line.
+
+    Returns:
+        (domain, error_type) or None
+    """
+    m = _LOG_ERROR_RE.search(message)
+    if not m:
+        return None
+    domain = m.group(1).rstrip(".")
+    error_type = m.group(2).strip().lower()
+    return domain, error_type
+
+
+def format_alert_message(
+    alerts: List[Tuple[str, str, str]],  # (domain, error_type, unit)
+    hostname: str,
+    tz: timezone,
+) -> str:
+    """Format batched alerts as a Telegram HTML message, grouped by service."""
+    now_str = datetime.now(tz=tz).strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "\u26a0\ufe0f <b>Snell Connection Alert</b>",
+        f"\U0001f4c5 <i>{now_str}</i>",
+        f"\U0001f5a5 Host: <code>{hostname}</code>",
+        "",
+    ]
+
+    # Two-level grouping: unit -> error_type -> [domains]
+    unit_map: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
+    seen: Set[Tuple[str, str, str]] = set()
+    for domain, error_type, unit in alerts:
+        unit_clean = unit or "snell-server"
+        key = (unit_clean, error_type, domain)
+        if key not in seen:
+            seen.add(key)
+            unit_map[unit_clean][error_type].append(domain)
+
+    for unit, errors in sorted(unit_map.items()):
+        lines.append(f"\U0001f4e6 <b><code>{unit}</code></b>")
+        for error_type in sorted(errors.keys()):
+            label = error_type.title()
+            lines.append(f"  \u2757 <b>{label}</b>:")
+            for domain in errors[error_type]:
+                lines.append(f"    \u2022 <code>{domain}</code>")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
+
+# Hard cap on dedup dict size to guard against memory exhaustion
+# under extreme scenarios (e.g. thousands of unique failing domains).
+_MAX_DEDUP_ENTRIES = 5000
+
+
+class AlertDeduplicator:
+    """Prevents duplicate alerts: only one alert per (domain, error_type) per cooldown period."""
+
+    def __init__(self, cooldown_seconds: int = 3600) -> None:
+        self._cooldown = cooldown_seconds
+        self._last_alert: Dict[str, float] = {}
+
+    def should_alert(self, domain: str, error_type: str) -> bool:
+        """Return True if an alert should be sent (and record the send time)."""
+        # Guard against unbounded growth under extreme scenarios
+        if len(self._last_alert) >= _MAX_DEDUP_ENTRIES:
+            self.cleanup()
+        key = f"{domain}:{error_type}"
+        now = time.time()
+        last = self._last_alert.get(key, 0)
+        if now - last >= self._cooldown:
+            self._last_alert[key] = now
+            return True
+        return False
+
+    def cleanup(self) -> None:
+        """Remove expired entries to prevent unbounded memory growth."""
+        now = time.time()
+        threshold = self._cooldown * 2
+        expired = [k for k, ts in self._last_alert.items() if now - ts > threshold]
+        for k in expired:
+            del self._last_alert[k]
+
+
+# ---------------------------------------------------------------------------
+# Journal Monitor
+# ---------------------------------------------------------------------------
+
+# Hard cap on pending alerts to prevent memory exhaustion when Telegram is
+# unreachable for an extended period. If exceeded, oldest alerts are dropped.
+_MAX_PENDING_ALERTS = 50
+
+
+class JournalMonitor:
+    """Monitors snell-server logs in real time using systemd.journal.Reader."""
+
+    def __init__(self, config: Dict, debug: bool = False) -> None:
+        self._config = config
+        self._debug = debug
+        self._dedup = AlertDeduplicator(config["alert_cooldown"])
+        self._hostname = os.uname().nodename
+        self._running = True
+        self._monitored_errors: Set[str] = set(config["monitor_errors"])
+        self._pending: List[Tuple[str, str, str]] = []
+        self._flush_interval = 30.0
+        self._flush_initial_delay = 5.0
+        self._first_alert_time: Optional[float] = None
+        self._tz = _get_timezone(config["timezone"])
+
+        self._journal: Any = None
+        self._journal_module: Any = None
+
+    @property
+    def journal_available(self) -> bool:
+        if self._journal_module is not None:
+            return True
+        try:
+            from systemd import journal  # noqa: PLC0415
+
+            self._journal_module = journal
+            return True
+        except ImportError:
+            return False
+
+    def _init_reader(self) -> None:
+        """Create and configure the journal Reader."""
+        if self._journal is not None:
+            return
+        j = self._journal_module
+        reader = j.Reader()
+        # Match by SyslogIdentifier — requires SyslogIdentifier=snell-server
+        # in the service unit files (snell-server.service and snell-server@.service).
+        # This is cleaner than _COMM because it scopes to systemd-managed instances.
+        reader.add_match(SYSLOG_IDENTIFIER="snell-server")
+        self._journal = reader
+
+    def _process_entry(self, entry: dict) -> Optional[Tuple[str, str, str]]:
+        """Process a single journal entry. Returns (domain, error_type, unit) or None."""
+        message = entry.get("MESSAGE", "")
+        if not message:
+            return None
+        parsed = parse_log_entry(message)
+        if parsed is None:
+            return None
+        domain, error_type = parsed
+        if error_type not in self._monitored_errors:
+            return None
+        unit = entry.get("_SYSTEMD_UNIT", "")
+        return domain, error_type, unit
+
+    def _flush_alerts(self) -> None:
+        """Send accumulated alerts. Clears queue on success, retains on failure for retry."""
+        if not self._pending:
+            return
+        message = format_alert_message(self._pending, self._hostname, self._tz)
+        logger.info(f"Sending alert batch ({len(self._pending)} items)")
+        if send_telegram_message(
+            self._config["telegram_bot_token"],
+            self._config["telegram_chat_id"],
+            message,
+        ):
+            logger.info("Alert sent successfully")
+            self._pending.clear()
+            self._first_alert_time = None
+        else:
+            logger.warning("Failed to send alert, will retry on next flush cycle")
+            # Prevent unbounded growth when Telegram is unreachable
+            if len(self._pending) > _MAX_PENDING_ALERTS:
+                dropped = len(self._pending) - _MAX_PENDING_ALERTS
+                logger.warning(
+                    f"Pending alerts exceeded limit, dropping {dropped} oldest"
+                )
+                self._pending = self._pending[-_MAX_PENDING_ALERTS:]
+
+    def _should_flush(self, now: float, last_flush: float) -> bool:
+        if not self._pending:
+            return False
+        if now - last_flush >= self._flush_interval:
+            return True
+        if self._first_alert_time is not None:
+            if now - self._first_alert_time >= self._flush_initial_delay:
+                return True
+        return False
+
+    def run_startup_lookback(self) -> None:
+        """Scan the last N minutes of logs on startup."""
+        lookback = self._config["startup_lookback"]
+        if lookback <= 0:
+            return
+        logger.info(f"Startup lookback: last {lookback} min")
+        j = self._journal_module
+        reader = j.Reader()
+        reader.add_match(SYSLOG_IDENTIFIER="snell-server")
+        cutoff = datetime.now() - timedelta(minutes=lookback)
+        reader.seek_realtime(cutoff)
+        found = 0
+        for entry in reader:
+            result = self._process_entry(entry)
+            if not result:
+                continue
+            domain, error_type, unit = result
+            if self._dedup.should_alert(domain, error_type):
+                self._pending.append((domain, error_type, unit))
+                found += 1
+        if found:
+            logger.info(f"Startup lookback: {found} new alerts")
+            self._first_alert_time = time.time()
+            self._flush_alerts()
+        else:
+            logger.info("Startup lookback: no new alerts")
+
+    def run(self) -> None:
+        """Main monitoring loop. Polls every N seconds via sleep(),
+        reads new entries backwards from tail, and alerts on connection errors.
+        """
+        if not self.journal_available:
+            logger.error(
+                "systemd.journal module not available. "
+                "Install: apt install python3-systemd"
+            )
+            sys.exit(1)
+
+        poll_interval = self._config.get("poll_interval", 1.0)
+
+        logger.info(f"Snell monitor starting on {self._hostname}")
+        logger.info(f"Monitoring errors: {', '.join(sorted(self._monitored_errors))}")
+        logger.info(f"Alert cooldown: {self._config['alert_cooldown']}s")
+        logger.info(f"Poll interval: {poll_interval}s")
+        logger.info(f"Timezone: {self._config['timezone']}")
+
+        self.run_startup_lookback()
+
+        self._init_reader()
+        reader = self._journal
+        reader.seek_tail()
+        reader.get_previous()
+
+        logger.info("Now following journal in real-time")
+
+        last_flush = time.time()
+        entry_count = 0
+        seen_hashes: Set[int] = set()  # hash(msg) for lightweight dedup
+
+        while self._running:
+            try:
+                time.sleep(poll_interval)
+            except Exception:
+                # sleep() may be interrupted by signals
+                if not self._running:
+                    break
+                continue
+
+            if not self._running:
+                break
+
+            try:
+                # Poll: read backwards from tail until hitting seen messages.
+                if self._debug:
+                    logger.debug("Polling...")
+                reader.seek_tail()
+                batch: List[dict] = []
+                while True:
+                    prev = reader.get_previous()
+                    if not prev:
+                        if self._debug:
+                            logger.debug("get_previous() -> None")
+                        break
+                    msg = prev.get("MESSAGE", "")
+                    msg_hash = hash(msg)
+                    if self._debug:
+                        logger.debug("prev msg: %s", msg[:120])
+                    if msg_hash in seen_hashes:
+                        if self._debug:
+                            logger.debug("Seen already, stopping backward scan")
+                        break
+                    seen_hashes.add(msg_hash)
+                    batch.append(prev)
+                    if len(batch) > 500:
+                        break
+
+                if self._debug:
+                    logger.debug("Batch size: %d", len(batch))
+
+                # Process in forward (chronological) order
+                for entry in reversed(batch):
+                    if self._debug:
+                        msg = entry.get("MESSAGE", "")
+                        logger.debug("Journal entry: %s", msg[:200])
+                    parsed = self._process_entry(entry)
+                    if not parsed:
+                        if self._debug:
+                            logger.debug("Skipped (not a monitored error)")
+                        continue
+                    domain, error_type, unit = parsed
+                    if self._dedup.should_alert(domain, error_type):
+                        logger.info(
+                            f"New alert: {domain} ({error_type})"
+                            f"{' [' + unit + ']' if unit else ''}"
+                        )
+                        self._pending.append((domain, error_type, unit))
+                        if self._first_alert_time is None:
+                            self._first_alert_time = time.time()
+                    entry_count += 1
+
+                # Prune seen_hashes periodically to bound memory
+                if len(seen_hashes) > 10000:
+                    seen_hashes = set(list(seen_hashes)[-5000:])
+
+                now = time.time()
+                if self._should_flush(now, last_flush):
+                    self._flush_alerts()
+                    last_flush = now
+
+                if entry_count > 200:
+                    self._dedup.cleanup()
+                    entry_count = 0
+
+            except Exception:
+                logger.exception("Error in monitor loop, sleeping 5s")
+                time.sleep(5)
+
+    def stop(self) -> None:
+        """Graceful shutdown — flush any pending alerts before exiting."""
+        logger.info("Shutting down monitor...")
+        self._running = False
+        self._flush_alerts()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="Monitor snell-server journal logs for connection errors "
+        "and send alerts via Telegram."
+    )
+    ap.add_argument(
+        "--test-telegram",
+        action="store_true",
+        help="Send a test message via Telegram and exit.",
+    )
+    ap.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging (shows every journal entry).",
+    )
+    return ap.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    config = load_config()
+
+    if not validate_config(config):
+        sys.exit(1)
+
+    tz = _get_timezone(config["timezone"])
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+        logger.debug("Debug mode enabled")
+
+    if args.test_telegram:
+        hostname = os.uname().nodename
+        now_str = datetime.now(tz=tz).strftime("%Y-%m-%d %H:%M:%S")
+        msg = (
+            "\u2705 <b>Snell Monitor Test</b>\n\n"
+            f"\U0001f5a5 Host: <code>{hostname}</code>\n"
+            f"\U0001f4c5 {now_str} ({config['timezone']})\n\n"
+            "Test message \u2014 monitor is configured correctly.\n"
+            "\n"
+            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+            "\u26a0\ufe0f <b>Snell Connection Alert</b>\n"
+            "\U0001f4c5 <i>2026-06-16 23:30:00</i>\n"
+            f"\U0001f5a5 Host: <code>{hostname}</code>\n"
+            "\n"
+            "\U0001f4e6 <b><code>snell-server@ios.service</code></b>\n"
+            "  \u2757 <b>Connection Refused</b>:\n"
+            "    \u2022 <code>dispatcher.is.autonavi.com</code>\n"
+            "\n"
+            "\U0001f4e6 <b><code>snell-server@mac.service</code></b>\n"
+            "  \u2757 <b>Connection Refused</b>:\n"
+            "    \u2022 <code>imap.forwardemail.net</code>\n"
+            "    \u2022 <code>smtp.example.com</code>\n"
+            "  \u2757 <b>Connection Timed Out</b>:\n"
+            "    \u2022 <code>api.other.com</code>\n"
+        )
+        ok = send_telegram_message(
+            config["telegram_bot_token"],
+            config["telegram_chat_id"],
+            msg,
+        )
+        if ok:
+            print("Test message sent successfully!")
+        else:
+            print("Failed to send test message.", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    monitor = JournalMonitor(config, debug=args.debug)
+
+    def _handle_signal(signum: int, frame: object) -> None:
+        del signum, frame
+        monitor.stop()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    try:
+        monitor.run()
+    except KeyboardInterrupt:
+        monitor.stop()
+    except Exception:
+        logger.exception("Fatal error")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,24 @@
+[Unit]
+Description=Snell Server Connection Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/usr/local/etc/snell-monitor.conf
+ExecStart=/usr/local/bin/snell-monitor
+Restart=always
+RestartSec=15
+StandardError=journal
+StandardOutput=journal
+SyslogIdentifier=snell-monitor
+
+# Security hardening (optional; comment out if you encounter issues)
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log
+ReadOnlyPaths=/usr/local/etc/snell-monitor.conf /usr/local/bin/snell-monitor
+
+[Install]
+WantedBy=multi-user.target
