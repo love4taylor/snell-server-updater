@@ -120,11 +120,13 @@ def load_config() -> Dict:
                     value = value.strip().strip('"').strip("'")
                     if key == "MONITOR_ERRORS":
                         config["monitor_errors"] = _parse_error_list(value)
+                    elif key == "LOG_LEVEL":
+                        config["log_level"] = value
                     elif key in ("ALERT_COOLDOWN", "STARTUP_LOOKBACK", "POLL_INTERVAL"):
                         try:
                             config[key.lower()] = float(value)
                         except ValueError:
-                            logger.warning(f"Invalid integer for {key}: {value}")
+                            logger.warning(f"Invalid number for {key}: {value}")
                     elif key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TIMEZONE"):
                         config[key.lower()] = value
         except OSError as e:
@@ -150,7 +152,7 @@ def load_config() -> Dict:
             try:
                 config[key.lower()] = float(os.environ[env_key])
             except ValueError:
-                logger.warning(f"Invalid integer for {env_key}")
+                logger.warning(f"Invalid number for {env_key}")
 
     return config
 
@@ -186,6 +188,11 @@ def send_telegram_message(bot_token: str, chat_id: str, text: str) -> bool:
             "Install: pip install requests  or  apt install python3-requests"
         )
         return False
+
+    MAX_MSG_LEN = 4000
+    if len(text) > MAX_MSG_LEN:
+        logger.warning("Message too long (%d chars), truncating", len(text))
+        text = text[:MAX_MSG_LEN] + "\n\u2026\n\u26a0\ufe0f (message truncated)"
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
@@ -472,8 +479,8 @@ class JournalMonitor:
         while self._running:
             try:
                 time.sleep(poll_interval)
-            except Exception:
-                # sleep() may be interrupted by signals
+            except InterruptedError:
+                # sleep() interrupted by signals
                 if not self._running:
                     break
                 continue

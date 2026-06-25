@@ -90,6 +90,8 @@ After=network.target nss-lookup.target network-online.target
 User={user}
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=yes
+PrivateTmp=yes
 SyslogIdentifier=snell-server
 ExecStart={binary} -c {config_dir}/server.conf
 Restart=on-failure
@@ -109,6 +111,8 @@ After=network.target nss-lookup.target network-online.target
 User={user}
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=yes
+PrivateTmp=yes
 SyslogIdentifier=snell-server
 ExecStart={binary} -c {config_dir}/%i.conf
 Restart=on-failure
@@ -372,7 +376,8 @@ def download_and_install(url: str, snell_path: Path) -> bool:
             tmp_target.chmod(0o755)
             os.replace(tmp_target, snell_path)
         except PermissionError:
-            fail("Permission denied; run with sudo/root")
+            log("\u274c Permission denied; run with sudo/root")
+            return False
         finally:
             try:
                 tmp_target.unlink()
@@ -590,7 +595,8 @@ def main() -> int:
 
         target_url = versions[target_ver]
 
-    assert target_ver is not None and target_url is not None
+    if target_ver is None or target_url is None:
+        fail("Failed to determine target version or download URL")
     log(f"\U0001f310 Target: {target_ver}")
 
     # 5. Version comparison
@@ -630,9 +636,6 @@ def main() -> int:
         if args.dry_run:
             log("   [DRY RUN] Would set up systemd service (user, config, units)")
         else:
-            if needs_download or args.force or not snell_path.is_file():
-                # Binary was just installed (or force), so it exists
-                pass
             do_install(snell_path, skip_wizard=args.skip_wizard)
 
     return 0

@@ -155,7 +155,7 @@ snell-monitor/snell-monitor --test-telegram
 
 - **Atomic binary replacement**: `os.replace()` ensures the running service isn't interrupted mid-write (`snell-server-updater.py:373`).
 - **Binary verification before install**: Downloaded binary is executed (`snell-server -v`) and checked for exit code + version output before replacing the live binary (`snell-server-updater.py:354-363`).
-- **Hardened systemd units**: Both service units include `CapabilityBoundingSet`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, and restricted `ReadWritePaths`/`ReadOnlyPaths`.
+- **Hardened systemd units**: The monitor's unit includes `CapabilityBoundingSet`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, and restricted `ReadWritePaths`/`ReadOnlyPaths`. The updater-generated units include `CapabilityBoundingSet`, `NoNewPrivileges`, and `PrivateTmp` (reflecting snell-server's broader filesystem requirements).
 - **Memory bounds**: The monitor caps dedup entries (5000) and pending alerts (50) to prevent OOM under attack/error storms.
 - **Secrets in env vars**: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are loaded from env or config file — never hardcoded in the script.
 
